@@ -1127,6 +1127,10 @@ async function parseFipLivemeta(raw) {
   return null;
 }
 
+// ── API Radio France officielle ────────────────────────────────────────────
+const RF_API_KEY = 'aeee080c-ef08-4ab6-9f06-8edb0624229e';
+const RF_GQL = 'https://openapi.radiofrance.fr/v1/graphql';
+
 async function fetchFipNow() {
   const body = document.getElementById('fip-now-body');
   body.innerHTML = '<div class="fip-empty">Chargement…</div>';
@@ -1134,66 +1138,78 @@ async function fetchFipNow() {
   document.getElementById('fip-select-controls').style.display = 'none';
   setFipHistStatus('', false);
 
-  const TARGET = 'https://api.radiofrance.fr/livemeta/pull/7';
-  const PROXIES = [
-    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-    u => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`,
-    u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-  ];
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const tsStart = now - 7200;
+    const res = await fetchWithTimeout(RF_GQL, 8000, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Token': RF_API_KEY },
+      body: JSON.stringify({
+        query: `{ grid(start:${tsStart} end:${now} station: FIP includeTracks: true) { ... on TrackStep { start end track { title mainArtists albumTitle } } } }`
+      })
+    });
+    const json = await res.json();
+    const steps = (json.data?.grid || []).filter(s => s.track);
 
-  const bust = '&_=' + Date.now();
-  for (const proxy of PROXIES) {
-    try {
-      const res  = await fetchWithTimeout(proxy(TARGET) + bust, 7000);
-      const json = await res.json();
-      const raw  = json.contents !== undefined ? json.contents : JSON.stringify(json);
-      const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
-
-      // Titre en cours
-      const track = await parseFipLivemeta(data);
-      if (track) {
-        fipCurrentTrack = track;
-        body.innerHTML = `
-          <div class="fip-now-row">
-            <div class="fip-thumb">📻</div>
-            <div class="track-info">
-              <div class="track-title">${track.title}</div>
-              <div class="track-artist" style="color:#E2007A">${track.artist}</div>
-            </div>
-            <div class="fip-live-dot"></div>
-          </div>
-          <div class="result-btns">
-            <button class="btn-fip-add" id="btn-fip-add" onclick="scrobbleFipNow()">Ajouter à Qobuz</button>
-            <button class="btn-skip" onclick="dismissFipNow()">Ignorer</button>
-          </div>`;
-      } else {
-        body.innerHTML = '<div class="fip-empty">Pas de titre musical en ce moment sur FIP</div>';
-      }
-
-      // Titres récents en dessous (cochables) — on exclut le titre en cours
-      const currentTitle = track ? track.title : null;
-      const now = Math.floor(Date.now() / 1000);
-      const allSteps = Object.values(data.steps || {})
-        .filter(s => s.title && s.title !== currentTitle && s.start <= now)
-        .sort((a, b) => b.start - a.start);
-      if (allSteps.length) {
-        const seen = new Set();
-        histTracks = allSteps.reduce((acc, s) => {
-          const key = (s.title + '|' + (s.authors || s.performers || '')).toLowerCase();
-          if (!seen.has(key)) { seen.add(key); acc.push({
-            title: s.title, artist: s.authors || s.performers || '',
-            time:  new Date(s.start * 1000).toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'}),
-            ts: s.start, selected: false, done: false
-          }); }
-          return acc;
-        }, []);
-        document.getElementById('fip-hist-list').style.display = 'block';
-        renderHist();
-      }
+    if (!steps.length) {
+      body.innerHTML = '<div class="fip-empty">Pas de titre musical en ce moment sur FIP</div>';
       return;
-    } catch(e) { /* essaie le proxy suivant */ }
+    }
+
+    // Titre en cours = dernier dont start <= now
+    const current = [...steps].reverse().find(s => s.start <= now);
+    if (current) {
+      fipCurrentTrack = {
+        title:  current.track.title,
+        artist: (current.track.mainArtists || []).join(', '),
+        album:  current.track.albumTitle || ''
+      };
+      body.innerHTML = `
+        <div class="fip-now-row">
+          <div class="fip-thumb">📻</div>
+          <div class="track-info">
+            <div class="track-title">${fipCurrentTrack.title}</div>
+            <div class="track-artist" style="color:#E2007A">${fipCurrentTrack.artist}</div>
+            ${fipCurrentTrack.album ? `<div class="track-album">${fipCurrentTrack.album}</div>` : ''}
+          </div>
+          <div class="fip-live-dot"></div>
+        </div>
+        <div class="result-btns">
+          <button class="btn-fip-add" id="btn-fip-add" onclick="scrobbleFipNow()">Ajouter à Qobuz</button>
+          <button class="btn-skip" onclick="dismissFipNow()">Ignorer</button>
+        </div>`;
+    } else {
+      body.innerHTML = '<div class="fip-empty">Pas de titre musical en ce moment sur FIP</div>';
+    }
+
+    // Titres récents (cochables)
+    const currentTitle = current ? current.track.title : null;
+    const recent = [...steps]
+      .filter(s => s.start <= now && s.track.title !== currentTitle)
+      .sort((a, b) => b.start - a.start);
+
+    if (recent.length) {
+      const seen = new Set();
+      histTracks = recent.reduce((acc, s) => {
+        const key = (s.track.title + '|' + (s.track.mainArtists||[]).join(',')).toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          acc.push({
+            title:  s.track.title,
+            artist: (s.track.mainArtists || []).join(', '),
+            time:   new Date(s.start * 1000).toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'}),
+            ts: s.start, selected: false, done: false
+          });
+        }
+        return acc;
+      }, []);
+      document.getElementById('fip-hist-list').style.display = 'block';
+      renderHist();
+    }
+    return;
+  } catch(e) {
+    body.innerHTML = '<div class="fip-empty">Impossible de joindre FIP. Réessaie.</div>';
   }
-  body.innerHTML = `<div class="fip-empty">Impossible de joindre FIP. Réessaie.</div>`;
 }
 
 async function scrobbleFipNow() {
@@ -1271,60 +1287,39 @@ async function loadFipHistory() {
   const tsStart = Math.floor(dateObj.getTime() / 1000);
   const tsEnd   = tsStart + 86400;
 
-  // 1. GraphQL FIP direct (avec variables correctes)
+  // API Radio France officielle
   try {
-    const res = await fetchWithTimeout('https://www.fip.fr/latest/api/graphql', 8000, {
+    const res = await fetchWithTimeout(RF_GQL, 8000, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Token': RF_API_KEY },
       body: JSON.stringify({
-        query: `{ timelineSongs(start:${tsStart} end:${tsEnd} stationId:7) { startTime song { title interpreters } } }`
+        query: `{ grid(start:${tsStart} end:${tsEnd} station: FIP includeTracks: true) { ... on TrackStep { start end track { title mainArtists albumTitle } } } }`
       })
     });
     const json = await res.json();
-    const songs = json.data?.timelineSongs;
-    if (songs && songs.length) {
-      histTracks = [...songs].reverse().map(s => ({
-        title:    s.song.title,
-        artist:   (s.song.interpreters || []).join(', '),
-        time:     new Date(s.startTime * 1000).toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'}),
-        ts: s.startTime, selected: false, done: false
-      }));
+    const steps = (json.data?.grid || []).filter(s => s.track);
+    if (steps.length) {
+      const seen = new Set();
+      histTracks = [...steps].reverse().reduce((acc, s) => {
+        const key = (s.track.title + '|' + (s.track.mainArtists||[]).join(',')).toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          acc.push({
+            title:  s.track.title,
+            artist: (s.track.mainArtists || []).join(', '),
+            time:   new Date(s.start * 1000).toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'}),
+            ts: s.start, selected: false, done: false
+          });
+        }
+        return acc;
+      }, []);
       renderHist();
       btn.disabled = false; btn.textContent = 'Charger';
       return;
     }
   } catch(e) {}
 
-  // 2. Fallback proxy (titres récents seulement)
-  const TARGET = 'https://api.radiofrance.fr/livemeta/pull/7';
-  const PROXIES = [
-    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-    u => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`,
-  ];
-  for (const proxy of PROXIES) {
-    try {
-      const res  = await fetchWithTimeout(proxy(TARGET), 6000);
-      const json = await res.json();
-      const raw  = json.contents !== undefined ? json.contents : JSON.stringify(json);
-      const data = JSON.parse(raw);
-      const steps = Object.values(data.steps || {})
-        .filter(s => s.title)
-        .sort((a, b) => b.start - a.start);
-      if (steps.length) {
-        histTracks = steps.map(s => ({
-          title: s.title, artist: s.authors || s.performers || '',
-          time:  new Date(s.start * 1000).toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'}),
-          ts: s.start, selected: false, done: false
-        }));
-        renderHist();
-        setFipHistStatus('⚠ Seulement les titres très récents disponibles', true);
-        btn.disabled = false; btn.textContent = 'Charger';
-        return;
-      }
-    } catch(e) {}
-  }
-
-  list.innerHTML = '<div class="h-empty">Historique non disponible.<br>L\'API FIP bloque les requêtes cross-origin depuis une appli web.</div>';
+  list.innerHTML = '<div class="h-empty">Historique non disponible pour cette date.</div>';
   document.getElementById('fip-select-controls').style.display = 'none';
   btn.disabled = false; btn.textContent = 'Charger';
 }
